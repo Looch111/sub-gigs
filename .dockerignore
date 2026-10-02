@@ -1,0 +1,5 @@
+node_modules
+chrome_session
+.env
+bot.log
+.git
