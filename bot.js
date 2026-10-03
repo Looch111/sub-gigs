@@ -23,7 +23,7 @@ function loadEnv() {
 const config = { ...loadEnv(), ...process.env };
 const USERNAME = config.SUBSGIGS_USERNAME || "@baltomisin10";
 const PASSWORD = config.SUBSGIGS_PASSWORD || "Baltom10";
-const CHECK_INTERVAL = Math.max(3, parseInt(config.CHECK_INTERVAL_SECONDS || "10", 10)) * 1000;
+const CHECK_INTERVAL = Math.max(1, parseInt(config.CHECK_INTERVAL_SECONDS || "2", 10)) * 1000;
 const BASE_URL = "https://subsgigs-alpha.vercel.app";
 const CHROME_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/google-chrome";
 
@@ -172,7 +172,7 @@ async function login(page) {
 }
 
 async function scanAndClaimSpots(page) {
-  // Extract all campaigns and check for active "Save a spot" buttons
+  // Extract all campaigns and check for active "Save a spot" buttons or open capacity
   const campaignData = await page.evaluate(() => {
     const articles = Array.from(document.querySelectorAll("article"));
     const results = [];
@@ -192,14 +192,19 @@ async function scanAndClaimSpots(page) {
       // Extract details
       const titleMatch = text.match(/([A-Z0-9& ]+)\s+(?:DIRECT SUBMISSION|LIVE)/i);
       const rewardMatch = text.match(/\$[\d\.]+/);
-      const spotsMatch = text.match(/(\d+\s*spots\s*currently\s*available|\d+\s*left)/i);
+      const spotsMatch = text.match(/(\d+)\s*spots\s*currently\s*available/i);
+      const spotsLeftCount = spotsMatch ? parseInt(spotsMatch[1], 10) : (hasSaveButton ? 1 : 0);
+
+      // A campaign is claimable if the button is active OR spotsLeft > 0
+      const isClaimable = hasSaveButton || (spotsLeftCount > 0 && /direct submission/i.test(text));
 
       results.push({
         url,
         title: titleMatch ? titleMatch[1].trim() : "SubsGigs Campaign",
         reward: rewardMatch ? rewardMatch[0] : "Reward",
-        spots: spotsMatch ? spotsMatch[0] : (hasSaveButton ? "Spots available" : "Full"),
-        hasSaveButton,
+        spots: spotsMatch ? `${spotsMatch[1]} spots available` : (isClaimable ? "Spots available" : "Full"),
+        hasSaveButton: isClaimable,
+        spotsCount: spotsLeftCount,
         rawText: text
       });
     }
@@ -211,55 +216,115 @@ async function scanAndClaimSpots(page) {
 }
 
 async function clickSaveSpotOnCard(page, campaignUrl) {
-  log(`⚡ [AUTO-RESERVE] Clicking 'Save a spot' for: ${campaignUrl}`);
+  log(`⚡ [AUTO-RESERVE] Executing lightning reservation for: ${campaignUrl}`);
+  const startTime = Date.now();
+
   try {
-    const clicked = await page.evaluate((targetUrl) => {
+    // 1. Intercept network response to confirm Server Action in real time
+    let actionConfirmed = false;
+    let actionError = null;
+
+    const onResponse = async (res) => {
+      try {
+        if (res.request().method() === "POST" && (res.url().includes("campaigns") || res.url().includes("subsgigs"))) {
+          const body = await res.text().catch(() => "");
+          if (body.includes("Spot reserved") || body.includes("success") || /reserved/i.test(body)) {
+            actionConfirmed = true;
+          } else if (body.includes("full") || body.includes("error") || body.includes("limit") || body.includes("claimed")) {
+            actionError = body.slice(0, 120);
+          }
+        }
+      } catch (e) {}
+    };
+    page.on("response", onResponse);
+
+    // 2. Trigger reservation via native form.requestSubmit() & button click on the card
+    const clickResult = await page.evaluate((targetUrl) => {
       const articles = Array.from(document.querySelectorAll("article"));
       for (const art of articles) {
         const link = art.querySelector('a[href*="/campaigns/"]');
         if (link && link.href === targetUrl) {
-          const btn = Array.from(art.querySelectorAll("button")).find(b => /save a spot/i.test(b.innerText));
+          const form = art.querySelector("form");
+          const btn = Array.from(art.querySelectorAll("button, input[type=submit]")).find(b => /save a spot/i.test(b.innerText));
+          
+          if (form && typeof form.requestSubmit === "function") {
+            form.requestSubmit(btn || undefined);
+            return { success: true, method: "form.requestSubmit" };
+          }
           if (btn && !btn.disabled) {
             btn.click();
-            return true;
+            return { success: true, method: "button.click" };
           }
         }
       }
-      return false;
+      return { success: false, method: "not_found" };
     }, campaignUrl);
 
-    if (!clicked) {
-      log("Could not find active 'Save a spot' button on card.");
-      return false;
+    // 3. Fallback: If not found on card, immediately navigate to campaign detail page and submit
+    if (!clickResult.success) {
+      log(`⚡ Button not yet mounted on feed card. Navigating to campaign detail page...`);
+      await page.goto(campaignUrl, { waitUntil: "domcontentloaded", timeout: 8000 }).catch(() => {});
+
+      await page.evaluate(() => {
+        const form = document.querySelector('form input[name="campaignId"]')?.closest("form") || document.querySelector("form");
+        const btn = Array.from(document.querySelectorAll("button")).find(b => /save a spot/i.test(b.innerText));
+        if (form && typeof form.requestSubmit === "function") {
+          form.requestSubmit(btn || undefined);
+          return true;
+        }
+        if (btn && !btn.disabled) {
+          btn.click();
+          return true;
+        }
+        return false;
+      });
     }
 
-    log("Button clicked! Waiting for server confirmation...");
-    // Next.js server action may cause soft or hard navigation; wait for network to idle
-    await new Promise(r => setTimeout(r, 4500));
+    // 4. Ultra-fast verification loop (check every 150ms up to 2.5s)
+    let isReserved = false;
+    for (let i = 0; i < 16; i++) {
+      await new Promise(r => setTimeout(r, 150));
 
-    // Safely re-check page text on the current active frame
-    const text = await page.evaluate(() => document.body.innerText).catch(() => "");
-    const errorMsg = await page.evaluate(() => document.querySelector('[role="alert"]')?.innerText).catch(() => null);
+      if (actionConfirmed) {
+        isReserved = true;
+        break;
+      }
 
-    const isReserved =
-      /release/i.test(text) ||
-      /reserved/i.test(text) ||
-      /submit your work/i.test(text) ||
-      /10 minutes/i.test(text) ||
-      !/save a spot/i.test(text); // If Save a spot button disappeared, it's either claimed or filled
+      // Check on-page text indicators
+      const state = await page.evaluate(() => {
+        const body = document.body ? document.body.innerText : "";
+        const alert = document.querySelector('[role="alert"]')?.innerText;
+        const status = document.querySelector('[role="status"]')?.innerText;
+        return {
+          hasReservedText: /release my spot/i.test(body) || /10 minutes/i.test(body) || /submit your work/i.test(body) || (status && /reserved/i.test(status)),
+          alert
+        };
+      }).catch(() => ({ hasReservedText: false, alert: null }));
 
-    if (!errorMsg && isReserved) {
-      log("🎉 SUCCESS: Spot successfully reserved for 10 minutes!");
+      if (state.hasReservedText) {
+        isReserved = true;
+        break;
+      }
+      if (state.alert) {
+        actionError = state.alert;
+        break;
+      }
+    }
+
+    page.off("response", onResponse);
+    const elapsed = Date.now() - startTime;
+
+    if (isReserved) {
+      log(`🎉 SUCCESS: Spot SECURED in ${elapsed}ms! 10-minute hold active.`);
       return true;
     } else {
-      log(`Reservation response: ${errorMsg || "Spot might be claimed or limit reached."}`);
+      log(`Reservation attempt finished in ${elapsed}ms. Result: ${actionError || "Spot may have been claimed by another user."}`);
       return false;
     }
   } catch (err) {
-    log(`Notice during reservation verification: ${err.message}`);
-    // Check if reserved anyway
-    const body = await page.evaluate(() => document.body.innerText).catch(() => "");
-    return /submit/i.test(body) || /release/i.test(body);
+    log(`Notice during reservation: ${err.message}`);
+    const body = await page.evaluate(() => document.body ? document.body.innerText : "").catch(() => "");
+    return /release/i.test(body) || /submit/i.test(body);
   }
 }
 
@@ -293,7 +358,7 @@ async function start() {
     process.exit(1);
   }
 
-  log("Monitor initialized. Listening for campaign drops...\n");
+  log("⚡ High-speed monitor active! Scanning for campaign drops...\n");
 
   // Send on-start notification to WhatsApp / configured channels
   await notifyStartup(config, {
@@ -301,11 +366,13 @@ async function start() {
     intervalSeconds: CHECK_INTERVAL / 1000
   });
 
+  let cycleCount = 0;
   while (true) {
     try {
-      // Reload campaigns
-      await page.goto(`${BASE_URL}/campaigns`, { waitUntil: "domcontentloaded" }).catch(() => {});
-      await new Promise(r => setTimeout(r, 2500));
+      // High-speed reload (no artificial sleep delays!)
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(async () => {
+        await page.goto(`${BASE_URL}/campaigns`, { waitUntil: "domcontentloaded", timeout: 10000 });
+      });
 
       if (page.url().includes("/login")) {
         log("Session logged out. Re-authenticating...");
@@ -314,19 +381,21 @@ async function start() {
       }
 
       const campaigns = await scanAndClaimSpots(page);
-      log(`Scanned ${campaigns.length} campaign(s). Status check:`);
+
+      cycleCount = (cycleCount || 0) + 1;
+      if (cycleCount % 15 === 0) {
+        log(`🟢 Heartbeat: Scanning active (${campaigns.length} campaigns monitored, 0 drops detected yet)`);
+      }
 
       for (const camp of campaigns) {
-        log(`  • [${camp.title}] ${camp.spots} | ${camp.reward} | Spot Button Active: ${camp.hasSaveButton}`);
-
         // If spots are available and we haven't already processed this campaign
         if (camp.hasSaveButton && !claimedCampaigns.has(camp.url)) {
-          log(`\n🚨 FOUND AVAILABLE SPOT ON: ${camp.title} (${camp.url})`);
+          log(`\n🚨 DETECTED AVAILABLE SPOT ON: ${camp.title} (${camp.url})`);
 
-          // 1. SAVE THE SPOT FIRST
+          // 1. AUTO-RESERVE INSTANTLY (SUB-SECOND)
           const reserved = await clickSaveSpotOnCard(page, camp.url);
 
-          // 2. DISPATCH NOTIFICATION
+          // 2. DISPATCH NOTIFICATION IMMEDIATELY IN PARALLEL
           await notifyAll(config, {
             title: camp.title,
             reward: camp.reward,
@@ -335,16 +404,20 @@ async function start() {
             reserved
           });
 
-          // Mark as processed
-          claimedCampaigns.add(camp.url);
+          // Mark as processed (auto-clear from claimedCampaigns after 10 mins)
+          if (reserved) {
+            claimedCampaigns.add(camp.url);
+            setTimeout(() => claimedCampaigns.delete(camp.url), 10 * 60 * 1000);
+          }
 
-          // Refresh page after claim
-          await page.goto(`${BASE_URL}/campaigns`, { waitUntil: "networkidle2" });
-          await new Promise(r => setTimeout(r, 1500));
+          // Return to campaigns feed if we navigated away
+          if (!page.url().endsWith("/campaigns")) {
+            await page.goto(`${BASE_URL}/campaigns`, { waitUntil: "domcontentloaded", timeout: 8000 }).catch(() => {});
+          }
         }
       }
     } catch (err) {
-      log(`Cycle error: ${err.message}`);
+      log(`Cycle notice: ${err.message}`);
     }
 
     await new Promise(r => setTimeout(r, CHECK_INTERVAL));

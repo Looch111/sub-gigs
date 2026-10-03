@@ -139,29 +139,44 @@ async function notifyAll(config, { title, reward, spots, campaignUrl, reserved }
   console.log(text);
   console.log("=======================================================\n");
 
+  const promises = [];
   const results = {};
+
   if (config.TELEGRAM_BOT_TOKEN && config.TELEGRAM_CHAT_ID) {
-    results.telegram = await sendTelegramAlert(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID, text);
-    console.log("[Notifier] Telegram notification sent:", results.telegram ? "SUCCESS" : "FAILED");
+    promises.push(
+      sendTelegramAlert(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID, text)
+        .then(r => { results.telegram = r; console.log("[Notifier] Telegram notification sent:", r ? "SUCCESS" : "FAILED"); })
+        .catch(err => { console.error("[Notifier] Telegram dispatch error:", err.message); })
+    );
   }
   if (config.DISCORD_WEBHOOK_URL) {
-    results.discord = await sendDiscordAlert(config.DISCORD_WEBHOOK_URL, text);
-    console.log("[Notifier] Discord notification sent:", results.discord ? "SUCCESS" : "FAILED");
+    promises.push(
+      sendDiscordAlert(config.DISCORD_WEBHOOK_URL, text)
+        .then(r => { results.discord = r; console.log("[Notifier] Discord notification sent:", r ? "SUCCESS" : "FAILED"); })
+        .catch(err => { console.error("[Notifier] Discord dispatch error:", err.message); })
+    );
   }
   if (config.NTFY_TOPIC) {
-    results.ntfy = await sendNtfyAlert(config.NTFY_TOPIC, `${reserved ? "Spot Reserved" : "Campaign Alert"}: ${title}`, text, campaignUrl);
-    console.log(`[Notifier] ntfy.sh notification sent to topic '${config.NTFY_TOPIC}':`, results.ntfy ? "SUCCESS" : "FAILED");
+    promises.push(
+      sendNtfyAlert(config.NTFY_TOPIC, `${reserved ? "Spot Reserved" : "Campaign Alert"}: ${title}`, text, campaignUrl)
+        .then(r => { results.ntfy = r; console.log(`[Notifier] ntfy.sh notification sent to topic '${config.NTFY_TOPIC}':`, r ? "SUCCESS" : "FAILED"); })
+        .catch(err => { console.error("[Notifier] ntfy dispatch error:", err.message); })
+    );
   }
   if (config.TWILIO_ACCOUNT_SID && config.TWILIO_AUTH_TOKEN && config.TWILIO_WHATSAPP_TO) {
-    results.whatsapp = await sendWhatsAppAlert(
-      config.TWILIO_ACCOUNT_SID,
-      config.TWILIO_AUTH_TOKEN,
-      config.TWILIO_WHATSAPP_FROM,
-      config.TWILIO_WHATSAPP_TO,
-      text
+    promises.push(
+      sendWhatsAppAlert(
+        config.TWILIO_ACCOUNT_SID,
+        config.TWILIO_AUTH_TOKEN,
+        config.TWILIO_WHATSAPP_FROM,
+        config.TWILIO_WHATSAPP_TO,
+        text
+      ).then(r => { results.whatsapp = r; console.log("[Notifier] Twilio WhatsApp notification sent:", r ? "SUCCESS" : "FAILED"); })
+      .catch(err => { console.error("[Notifier] WhatsApp dispatch error:", err.message); })
     );
-    console.log("[Notifier] Twilio WhatsApp notification sent:", results.whatsapp ? "SUCCESS" : "FAILED");
   }
+
+  await Promise.allSettled(promises);
 
   // Audible bell in terminal
   process.stdout.write("\x07");
