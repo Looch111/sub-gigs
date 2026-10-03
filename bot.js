@@ -48,18 +48,26 @@ function log(msg) {
 
 async function login(page) {
   log("Checking SubsGigs session...");
-  await page.goto(`${BASE_URL}/campaigns`, { waitUntil: "networkidle2" });
-  await new Promise(r => setTimeout(r, 1500));
+  try {
+    await page.goto(`${BASE_URL}/campaigns`, { waitUntil: "domcontentloaded", timeout: 20000 });
+    await new Promise(r => setTimeout(r, 1500));
+  } catch (err) {
+    log(`Notice while checking session: ${err.message}`);
+  }
 
-  let isDashboard = await page.evaluate(() => document.body.innerText.includes("CREATOR DASHBOARD"));
-  if (isDashboard) {
+  let isDashboard = await page.evaluate(() => {
+    const text = document.body ? document.body.innerText : "";
+    return text.includes("CREATOR DASHBOARD") || text.includes("Log out") || text.includes("Campaigns");
+  }).catch(() => false);
+
+  if (isDashboard && !page.url().includes("/login")) {
     log("Already logged in! Session active.");
     return true;
   }
 
   log(`Navigating to login and submitting credentials for ${USERNAME}...`);
-  await page.goto(`${BASE_URL}/login`, { waitUntil: "networkidle2" });
-  
+  await page.goto(`${BASE_URL}/login`, { waitUntil: "networkidle2", timeout: 30000 });
+
   // Clear inputs before typing
   await page.evaluate(() => {
     const u = document.querySelector("input[name=username]");
@@ -68,23 +76,98 @@ async function login(page) {
     if (p) p.value = "";
   });
 
-  await page.type("input[name=username]", USERNAME);
+  // SubsGigs expects Twitter/X handle. Ensure clean format
+  await page.type("input[name=username]", USERNAME.trim());
   await page.type("input[name=password]", PASSWORD);
+
+  // Monitor server response
+  let serverStatus = null;
+  let serverErrorDigest = null;
+  const onResponse = async (res) => {
+    if (res.request().method() === "POST" && res.url().includes("login")) {
+      serverStatus = res.status();
+      try {
+        const body = await res.text();
+        if (body.includes("digest")) {
+          const match = body.match(/"digest":\s*"([^"]+)"/);
+          serverErrorDigest = match ? match[1] : "server-error";
+        }
+      } catch (e) {}
+    }
+  };
+  page.on("response", onResponse);
+
   await page.click("button[type=submit]");
 
-  // Allow server action to complete
-  await new Promise(r => setTimeout(r, 4500));
+  // Poll for result up to 25 seconds (do not navigate away prematurely)
+  let success = false;
+  let detectedError = null;
 
-  await page.goto(`${BASE_URL}/campaigns`, { waitUntil: "networkidle2" });
-  await new Promise(r => setTimeout(r, 1500));
+  for (let i = 0; i < 25; i++) {
+    await new Promise(r => setTimeout(r, 1000));
 
-  isDashboard = await page.evaluate(() => document.body.innerText.includes("CREATOR DASHBOARD"));
-  if (isDashboard) {
-    log("Login successful! Creator Dashboard reached.");
-    return true;
+    // Check if redirected to dashboard/campaigns
+    const currentUrl = page.url();
+    if (!currentUrl.includes("/login")) {
+      success = true;
+      break;
+    }
+
+    // Check on-page state
+    const pageState = await page.evaluate(() => {
+      const btn = document.querySelector("button[type=submit]");
+      const body = document.body ? document.body.innerText : "";
+      const isPending = btn ? btn.innerText.includes("Please wait") || btn.disabled : false;
+      const errorEl = document.querySelector('[role="alert"], [class*="error"], form p.text-red-500, form .text-rose-500');
+      const errorMsg = errorEl ? errorEl.innerText.trim() : null;
+      return { isPending, errorMsg, body };
+    }).catch(() => ({ isPending: false, errorMsg: null, body: "" }));
+
+    if (pageState.errorMsg) {
+      detectedError = pageState.errorMsg;
+      break;
+    }
+
+    // Check if session cookie appeared
+    const cookies = await page.cookies();
+    const hasAuthCookie = cookies.some(c => c.name.includes("session") || c.name.includes("token") || c.name.includes("auth"));
+    if (hasAuthCookie) {
+      success = true;
+      break;
+    }
+
+    // If server responded with 500 error
+    if (serverStatus === 500) {
+      detectedError = `SubsGigs server responded with HTTP 500 Internal Error (digest: ${serverErrorDigest || "unknown"}). The SubsGigs backend database is currently down or unreachable.`;
+      break;
+    }
   }
 
-  log("Login verification failed. Please check your credentials in .env");
+  page.off("response", onResponse);
+
+  // If login indicated success or redirected, verify dashboard
+  if (success || !page.url().includes("/login")) {
+    await page.goto(`${BASE_URL}/campaigns`, { waitUntil: "networkidle2", timeout: 20000 }).catch(() => {});
+    await new Promise(r => setTimeout(r, 1500));
+    isDashboard = await page.evaluate(() => {
+      const text = document.body ? document.body.innerText : "";
+      return text.includes("CREATOR DASHBOARD") || text.includes("Log out") || text.includes("Campaigns");
+    }).catch(() => false);
+
+    if (isDashboard && !page.url().includes("/login")) {
+      log("Login successful! Creator Dashboard reached.");
+      return true;
+    }
+  }
+
+  if (detectedError) {
+    log(`❌ Login failed: ${detectedError}`);
+  } else if (serverStatus === 500) {
+    log(`❌ SubsGigs Backend Outage: Server returned HTTP 500. The database is unreachable.`);
+  } else {
+    log("❌ Login verification failed. Please check credentials or check if SubsGigs server is reachable.");
+  }
+
   return false;
 }
 
