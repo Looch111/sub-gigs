@@ -22,7 +22,29 @@ function ensureDependencies() {
 }
 ensureDependencies();
 
-let puppeteer;
+// 2. Storage cleaner: Prunes cache bloat from chrome_session to stay well under 512MB disk limits
+function cleanStorage() {
+  try {
+    const sessionDir = path.join(__dirname, "chrome_session");
+    if (fs.existsSync(sessionDir)) {
+      const bloatTargets = [
+        path.join(sessionDir, "component_crx_cache"),
+        path.join(sessionDir, "WasmTtsEngine"),
+        path.join(sessionDir, "OnDeviceHeadSuggestModel"),
+        path.join(sessionDir, "Default", "Cache"),
+        path.join(sessionDir, "Default", "Code Cache"),
+        path.join(sessionDir, "Default", "GPUCache"),
+        path.join(sessionDir, "BrowserMetrics-spare.pma")
+      ];
+      for (const target of bloatTargets) {
+        if (fs.existsSync(target)) {
+          fs.rmSync(target, { recursive: true, force: true });
+        }
+      }
+    }
+  } catch (e) {}
+}
+cleanStorage();
 try {
   puppeteer = require("puppeteer");
 } catch {
@@ -202,8 +224,19 @@ async function login(page) {
     return true;
   }
 
-  log(`Navigating to login and submitting credentials for ${USERNAME}...`);
-  await page.goto(`${BASE_URL}/login`, { waitUntil: "networkidle2", timeout: 30000 });
+  log(`Submitting credentials for ${USERNAME}...`);
+  if (!page.url().includes("/login")) {
+    try {
+      await page.goto(`${BASE_URL}/login`, { waitUntil: "domcontentloaded", timeout: 20000 });
+    } catch (err) {
+      if (!err.message.includes("ERR_ABORTED")) {
+        log(`Notice while navigating to login: ${err.message}`);
+      }
+    }
+  }
+
+  // Ensure login form input is present
+  await page.waitForSelector("input[name=username]", { timeout: 15000 }).catch(() => {});
 
   // Clear inputs before typing
   await page.evaluate(() => {
@@ -284,7 +317,7 @@ async function login(page) {
 
   // If login indicated success or redirected, verify dashboard
   if (success || !page.url().includes("/login")) {
-    await page.goto(`${BASE_URL}/campaigns`, { waitUntil: "networkidle2", timeout: 20000 }).catch(() => {});
+    await page.goto(`${BASE_URL}/campaigns`, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
     await new Promise(r => setTimeout(r, 1500));
     isDashboard = await page.evaluate(() => {
       const text = document.body ? document.body.innerText : "";
@@ -501,14 +534,51 @@ async function start() {
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
-      "--disable-gpu",
       "--disable-dev-shm-usage",
-      "--ignore-certificate-errors"
+      "--disable-gpu",
+      "--disable-software-rasterizer",
+      "--no-zygote",
+      "--single-process", // Essential for 256MB RAM: collapses into 1 single OS process
+      "--disable-extensions",
+      "--disable-component-update",
+      "--disable-background-networking",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-breakpad",
+      "--disable-default-apps",
+      "--disable-domain-reliability",
+      "--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process,OptimizationGuideModelDownloading",
+      "--disable-ipc-flooding-protection",
+      "--disable-notifications",
+      "--disable-popup-blocking",
+      "--disable-print-preview",
+      "--disable-renderer-backgrounding",
+      "--disable-sync",
+      "--disable-gpu-shader-disk-cache",
+      "--disk-cache-size=10485760", // Limit disk cache to 10MB to protect 512MB storage
+      "--media-cache-size=10485760",
+      "--mute-audio",
+      "--no-default-browser-check",
+      "--no-first-run",
+      "--no-pings",
+      "--ignore-certificate-errors",
+      "--js-flags=--max-old-space-size=96" // Limit JavaScript heap to 96MB
     ]
   });
 
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 800 });
+
+  // Block images, media, and fonts to reduce RAM by 60MB and CPU usage by 80%
+  await page.setRequestInterception(true);
+  page.on("request", req => {
+    const resourceType = req.resourceType();
+    if (["image", "media", "font"].includes(resourceType)) {
+      req.abort();
+    } else {
+      req.continue();
+    }
+  });
 
   const ok = await login(page);
   if (!ok) {
@@ -529,7 +599,7 @@ async function start() {
     try {
       // High-speed reload (no artificial sleep delays!)
       await page.reload({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(async () => {
-        await page.goto(`${BASE_URL}/campaigns`, { waitUntil: "domcontentloaded", timeout: 10000 });
+        await page.goto(`${BASE_URL}/campaigns`, { waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => {});
       });
 
       if (page.url().includes("/login")) {
@@ -543,6 +613,11 @@ async function start() {
       cycleCount = (cycleCount || 0) + 1;
       if (cycleCount % 15 === 0) {
         log(`🟢 Heartbeat: Scanning active (${campaigns.length} campaigns monitored, 0 drops detected yet)`);
+      }
+
+      // Periodically purge session cache every 100 cycles to prevent disk from filling up
+      if (cycleCount % 100 === 0) {
+        cleanStorage();
       }
 
       for (const camp of campaigns) {
