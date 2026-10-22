@@ -22,7 +22,30 @@ function ensureDependencies() {
 }
 ensureDependencies();
 
-// 2. Storage cleaner: Prunes cache bloat from chrome_session to stay well under 512MB disk limits
+// 2. Headless Shell Finder: Resolves ultra-lightweight browser binary (saves ~130MB RAM & 400MB disk)
+function findHeadlessShellInCache() {
+  const baseDir = path.join(__dirname, ".cache", "puppeteer", "chrome-headless-shell");
+  if (!fs.existsSync(baseDir)) return null;
+
+  function search(dir) {
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          const found = search(fullPath);
+          if (found) return found;
+        } else if (entry.name === "chrome-headless-shell" || entry.name === "chrome-headless-shell.exe") {
+          return fullPath;
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+  return search(baseDir);
+}
+
+// 3. Storage cleaner: Prunes cache bloat from chrome_session & heavy full Chrome to stay well under 512MB disk limits
 function cleanStorage() {
   try {
     const sessionDir = path.join(__dirname, "chrome_session");
@@ -42,9 +65,19 @@ function cleanStorage() {
         }
       }
     }
+
+    // Automatically remove heavy full Chrome binary (400MB) if lightweight headless shell exists
+    const fullChromeDir = path.join(__dirname, ".cache", "puppeteer", "chrome");
+    const shellBinary = findHeadlessShellInCache();
+    if (shellBinary && fs.existsSync(fullChromeDir)) {
+      console.log("[Storage] Purging old heavy full Chrome binary (freeing ~400MB disk space)...");
+      fs.rmSync(fullChromeDir, { recursive: true, force: true });
+    }
   } catch (e) {}
 }
 cleanStorage();
+
+let puppeteer;
 try {
   puppeteer = require("puppeteer");
 } catch {
@@ -79,14 +112,17 @@ const BASE_URL = "https://subsgigs-alpha.vercel.app";
 async function resolveChromePath(puppeteerModule, appConfig) {
   // 1. Explicit configuration in .env or environment variable
   const configured = appConfig.PUPPETEER_EXECUTABLE_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || appConfig.CHROME_PATH;
-  if (configured) {
-    if (fs.existsSync(configured)) {
-      return configured;
-    }
-    console.warn(`[Chrome] Configured path '${configured}' was not found on disk. Checking system alternatives...`);
+  if (configured && fs.existsSync(configured)) {
+    return configured;
   }
 
-  // 2. Common Linux / Docker / Pterodactyl server paths
+  // 2. Prefer lightweight chrome-headless-shell (uses ~150MB RAM instead of 285MB!)
+  const cachedShell = findHeadlessShellInCache();
+  if (cachedShell && fs.existsSync(cachedShell)) {
+    return cachedShell;
+  }
+
+  // 3. Common Linux / Docker / Pterodactyl server paths
   const linuxCandidates = [
     "/usr/bin/chromium-browser",
     "/usr/bin/chromium",
@@ -102,7 +138,7 @@ async function resolveChromePath(puppeteerModule, appConfig) {
     }
   }
 
-  // 3. Common Windows paths
+  // 4. Common Windows paths
   if (process.platform === "win32") {
     const winCandidates = [
       "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
@@ -117,7 +153,7 @@ async function resolveChromePath(puppeteerModule, appConfig) {
     }
   }
 
-  // 4. Common macOS paths
+  // 5. Common macOS paths
   if (process.platform === "darwin") {
     const macCandidates = [
       "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -129,44 +165,26 @@ async function resolveChromePath(puppeteerModule, appConfig) {
     }
   }
 
-  // 5. Puppeteer built-in / downloaded Chrome for Testing
-  try {
-    if (puppeteerModule && typeof puppeteerModule.executablePath === "function") {
-      const pPath = await puppeteerModule.executablePath();
-      if (pPath && fs.existsSync(pPath)) {
-        return pPath;
-      }
-    }
-  } catch (e) {}
-
-  // 6. First-Run Auto-Installer for Bot-Hosting.net / Servers:
-  // If no browser binary was found anywhere, automatically download Chrome now!
+  // 6. First-Run Auto-Installer for Bot-Hosting.net (256MB RAM / 512MB storage):
+  // Download ultra-lightweight chrome-headless-shell directly!
   console.log("==========================================================================");
-  console.log("  [First Run Setup] Chrome browser binary is not installed!               ");
-  console.log("  Automatically downloading Chrome for Testing into .cache...             ");
-  console.log("  Please wait 30-60 seconds (this only happens once)...                   ");
+  console.log("  [First Run Setup] Downloading ultra-lightweight chrome-headless-shell... ");
+  console.log("  (Uses 50% less RAM and disk space for Bot-Hosting.net 256MB container)  ");
+  console.log("  Please wait 30-45 seconds (this only happens once)...                   ");
   console.log("==========================================================================");
 
   try {
-    execSync("npx puppeteer browsers install chrome", { stdio: "inherit", cwd: __dirname });
-    if (puppeteerModule && typeof puppeteerModule.executablePath === "function") {
-      const pPath = await puppeteerModule.executablePath();
-      if (pPath && fs.existsSync(pPath)) {
-        console.log("  [First Run Setup] Chrome installed successfully at:", pPath);
-        return pPath;
-      }
+    execSync("npx puppeteer browsers install chrome-headless-shell", { stdio: "inherit", cwd: __dirname });
+    const newlyInstalled = findHeadlessShellInCache();
+    if (newlyInstalled && fs.existsSync(newlyInstalled)) {
+      console.log("  [First Run Setup] chrome-headless-shell installed successfully at:", newlyInstalled);
+      return newlyInstalled;
     }
   } catch (err) {
-    console.warn("  [First Run Setup] Standard Chrome install returned an error:", err.message);
-    try {
-      console.log("  [First Run Setup] Trying fallback: installing chrome-headless-shell...");
-      execSync("npx puppeteer browsers install chrome-headless-shell", { stdio: "inherit", cwd: __dirname });
-    } catch (e) {
-      console.error("  [First Run Setup] Fallback install error:", e.message);
-    }
+    console.warn("  [First Run Setup] chrome-headless-shell install notice:", err.message);
   }
 
-  // Check again after installation
+  // Fallback to standard puppeteer executablePath if available
   try {
     if (puppeteerModule && typeof puppeteerModule.executablePath === "function") {
       const pPath = await puppeteerModule.executablePath();
@@ -175,13 +193,6 @@ async function resolveChromePath(puppeteerModule, appConfig) {
       }
     }
   } catch (e) {}
-
-  // Check candidate paths again in case it got installed to one of the system paths
-  for (const candidate of linuxCandidates) {
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
 
   return null;
 }
@@ -527,10 +538,11 @@ async function start() {
   log(`Browser executable: ${chromePath}`);
 
   const userDataDir = path.join(__dirname, "chrome_session");
+  const isHeadlessShell = chromePath.includes("headless-shell");
   const browser = await puppeteer.launch({
     executablePath: chromePath,
     userDataDir,
-    headless: "new",
+    headless: isHeadlessShell ? "shell" : "new",
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
@@ -538,7 +550,8 @@ async function start() {
       "--disable-gpu",
       "--disable-software-rasterizer",
       "--no-zygote",
-      "--single-process", // Essential for 256MB RAM: collapses into 1 single OS process
+      "--single-process", // Essential for 256MB RAM: single process instead of 4
+      "--renderer-process-limit=1",
       "--disable-extensions",
       "--disable-component-update",
       "--disable-background-networking",
@@ -547,7 +560,7 @@ async function start() {
       "--disable-breakpad",
       "--disable-default-apps",
       "--disable-domain-reliability",
-      "--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process,OptimizationGuideModelDownloading",
+      "--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process,OptimizationGuideModelDownloading,MediaRouter",
       "--disable-ipc-flooding-protection",
       "--disable-notifications",
       "--disable-popup-blocking",
@@ -555,30 +568,33 @@ async function start() {
       "--disable-renderer-backgrounding",
       "--disable-sync",
       "--disable-gpu-shader-disk-cache",
-      "--disk-cache-size=10485760", // Limit disk cache to 10MB to protect 512MB storage
-      "--media-cache-size=10485760",
+      "--disk-cache-size=1",
+      "--media-cache-size=1",
       "--mute-audio",
       "--no-default-browser-check",
       "--no-first-run",
       "--no-pings",
       "--ignore-certificate-errors",
-      "--js-flags=--max-old-space-size=96" // Limit JavaScript heap to 96MB
+      "--js-flags=--max-old-space-size=48" // Strictly cap JavaScript heap to 48MB
     ]
   });
 
-  const page = await browser.newPage();
-  await page.setViewport({ width: 1280, height: 800 });
+  async function setupPage(p) {
+    await p.setViewport({ width: 1280, height: 800 });
+    await p.setRequestInterception(true);
+    p.on("request", req => {
+      const resourceType = req.resourceType();
+      // Block images, media, fonts, and stylesheets to keep RAM flat at ~160MB and CPU under 5%
+      if (["image", "media", "font", "stylesheet"].includes(resourceType)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+  }
 
-  // Block images, media, and fonts to reduce RAM by 60MB and CPU usage by 80%
-  await page.setRequestInterception(true);
-  page.on("request", req => {
-    const resourceType = req.resourceType();
-    if (["image", "media", "font"].includes(resourceType)) {
-      req.abort();
-    } else {
-      req.continue();
-    }
-  });
+  let page = await browser.newPage();
+  await setupPage(page);
 
   const ok = await login(page);
   if (!ok) {
@@ -615,9 +631,21 @@ async function start() {
         log(`🟢 Heartbeat: Scanning active (${campaigns.length} campaigns monitored, 0 drops detected yet)`);
       }
 
-      // Periodically purge session cache every 100 cycles to prevent disk from filling up
-      if (cycleCount % 100 === 0) {
-        cleanStorage();
+      // Tab recycling & Garbage Collection: Destroys old DOM contexts every 20 cycles to keep RAM flat at ~160MB
+      if (cycleCount % 20 === 0) {
+        try {
+          await page.close();
+          page = await browser.newPage();
+          await setupPage(page);
+          await page.goto(`${BASE_URL}/campaigns`, { waitUntil: "domcontentloaded", timeout: 12000 }).catch(() => {});
+          const cdp = await page.createCDPSession();
+          await cdp.send("HeapProfiler.collectGarbage").catch(() => {});
+          await cdp.detach().catch(() => {});
+          cleanStorage();
+          if (global.gc) global.gc();
+        } catch (e) {
+          log(`Tab refresh note: ${e.message}`);
+        }
       }
 
       for (const camp of campaigns) {
