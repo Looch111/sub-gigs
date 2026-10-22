@@ -1,4 +1,9 @@
-const puppeteer = require("puppeteer-core");
+let puppeteer;
+try {
+  puppeteer = require("puppeteer");
+} catch {
+  puppeteer = require("puppeteer-core");
+}
 const fs = require("fs");
 const path = require("path");
 const { notifyAll, notifyStartup } = require("./notifier");
@@ -25,7 +30,73 @@ const USERNAME = config.SUBSGIGS_USERNAME || "@baltomisin10";
 const PASSWORD = config.SUBSGIGS_PASSWORD || "Baltom10";
 const CHECK_INTERVAL = Math.max(1, parseInt(config.CHECK_INTERVAL_SECONDS || "2", 10)) * 1000;
 const BASE_URL = "https://subsgigs-alpha.vercel.app";
-const CHROME_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/google-chrome";
+
+// Automatically resolve Chrome/Chromium executable across Linux, Docker, Pterodactyl, macOS, Windows, and Puppeteer cache
+async function resolveChromePath(puppeteerModule, appConfig) {
+  // 1. Explicit configuration in .env or environment variable
+  const configured = appConfig.PUPPETEER_EXECUTABLE_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || appConfig.CHROME_PATH;
+  if (configured) {
+    if (fs.existsSync(configured)) {
+      return configured;
+    }
+    console.warn(`[Chrome] Configured path '${configured}' was not found on disk. Checking system alternatives...`);
+  }
+
+  // 2. Common Linux / Docker / Pterodactyl server paths
+  const linuxCandidates = [
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/google-chrome",
+    "/usr/lib/chromium/chrome",
+    "/usr/lib/chromium-browser/chromium-browser",
+    "/snap/bin/chromium"
+  ];
+  for (const candidate of linuxCandidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  // 3. Common Windows paths
+  if (process.platform === "win32") {
+    const winCandidates = [
+      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Google/Chrome/Application/chrome.exe") : null,
+      "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+      "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe"
+    ].filter(Boolean);
+
+    for (const candidate of winCandidates) {
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  }
+
+  // 4. Common macOS paths
+  if (process.platform === "darwin") {
+    const macCandidates = [
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
+      "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+    ];
+    for (const candidate of macCandidates) {
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  }
+
+  // 5. Puppeteer built-in / downloaded Chrome for Testing
+  try {
+    if (puppeteerModule && typeof puppeteerModule.executablePath === "function") {
+      const pPath = await puppeteerModule.executablePath();
+      if (pPath && fs.existsSync(pPath)) {
+        return pPath;
+      }
+    }
+  } catch (e) {}
+
+  return null;
+}
 
 // Optional HTTP server for Render free web service health checks
 if (process.env.PORT) {
@@ -335,9 +406,30 @@ async function start() {
   log(`Account: ${USERNAME}`);
   log(`Scan Frequency: every ${CHECK_INTERVAL / 1000}s`);
 
+  const chromePath = await resolveChromePath(puppeteer, config);
+  if (!chromePath) {
+    log("==========================================================================");
+    log("❌ FATAL: Chrome/Chromium browser was not found on this system!");
+    log("==========================================================================");
+    log("To fix this on your server:");
+    log("  1. If hosting on Pterodactyl / Bot-Hosting panel (server path /home/container):");
+    log("     • In your web panel, open the 'Startup' or 'Settings' tab.");
+    log("     • Change 'Docker Image' to: ghcr.io/parkervcp/apps:puppeteer");
+    log("     • Restart your server (Chromium is pre-installed at /usr/bin/chromium-browser).");
+    log("  2. If hosting on Ubuntu / Debian VPS:");
+    log("     • Run: sudo apt-get update && sudo apt-get install -y chromium-browser");
+    log("  3. If using Docker / Render / Railway:");
+    log("     • Use the provided Dockerfile or set PUPPETEER_EXECUTABLE_PATH.");
+    log("  4. Or set PUPPETEER_EXECUTABLE_PATH in your .env file to your browser path.");
+    log("==========================================================================");
+    process.exit(1);
+  }
+
+  log(`Browser executable: ${chromePath}`);
+
   const userDataDir = path.join(__dirname, "chrome_session");
   const browser = await puppeteer.launch({
-    executablePath: CHROME_PATH,
+    executablePath: chromePath,
     userDataDir,
     headless: "new",
     args: [

@@ -95,19 +95,39 @@ To start the bot in the terminal:
 node bot.js
 ```
 
-### Running 24/7 in the Background
-To keep it running continuously in the background even if you close the terminal:
+## 🌐 Hosting on a Server (24/7 Cloud Deployment)
+
+### 1. Pterodactyl Panel / Bot-Hosting.net / FalixNodes (Where path is `/home/container`)
+Pterodactyl runs servers inside isolated Docker containers. Follow these steps so Chrome is available:
+1. In your server panel, navigate to the **Startup** or **Settings** tab.
+2. Look for the **Docker Image** setting.
+3. Replace the default Node.js image with the official Puppeteer container image:
+   ```text
+   ghcr.io/parkervcp/apps:puppeteer
+   ```
+4. Click Save and click **Reinstall Server** or restart your server.
+5. In the console, run `npm install`. The bot will automatically detect Chromium at `/usr/bin/chromium-browser`!
+
+### 2. Linux VPS (Ubuntu / Debian)
+If hosting on an AWS EC2, DigitalOcean Droplet, Hetzner, or any Linux VPS:
 ```bash
-nohup node bot.js > bot.log 2>&1 &
+# 1. Install Chromium and required libraries
+sudo apt-get update
+sudo apt-get install -y chromium-browser
+
+# 2. Clone repo and install dependencies
+git clone <your-repo>
+cd notification
+npm install
+
+# 3. Run with PM2 or systemd for 24/7 uptime
+npm install -g pm2
+pm2 start bot.js --name subsgigs-bot
+pm2 save
+pm2 startup
 ```
 
-To check on the logs in real time:
-```bash
-tail -f bot.log
-```
+### 3. Docker / Render / Railway
+If deploying via Docker:
+- Simply use the included [Dockerfile](file:///home/kadiri-emmanuel/notification/Dockerfile), which installs Google Chrome Stable and configures all necessary flags automatically.
 
-To stop the background bot:
-```bash
-pkill -f "node bot.js"
-```
-# sub-gigs
