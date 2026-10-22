@@ -4,3 +4,4 @@ chrome_session/
 bot.log
 *.log
 .DS_Store
+.cache/

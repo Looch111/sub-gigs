@@ -1,13 +1,35 @@
+const fs = require("fs");
+const path = require("path");
+const { execSync } = require("child_process");
+
+// 1. Automatic dependency installer on first run (especially for Bot-Hosting.net / Pterodactyl)
+function ensureDependencies() {
+  const nodeModulesPath = path.join(__dirname, "node_modules");
+  const puppeteerPath = path.join(nodeModulesPath, "puppeteer");
+  const puppeteerCorePath = path.join(nodeModulesPath, "puppeteer-core");
+
+  if (!fs.existsSync(nodeModulesPath) || (!fs.existsSync(puppeteerPath) && !fs.existsSync(puppeteerCorePath))) {
+    console.log("==========================================================================");
+    console.log("  [First Run Setup] Dependencies missing! Running npm install...          ");
+    console.log("==========================================================================");
+    try {
+      execSync("npm install", { stdio: "inherit", cwd: __dirname });
+      console.log("  [First Run Setup] Dependencies installed successfully!");
+    } catch (err) {
+      console.error("  [First Run Setup] Error during npm install:", err.message);
+    }
+  }
+}
+ensureDependencies();
+
 let puppeteer;
 try {
   puppeteer = require("puppeteer");
 } catch {
   puppeteer = require("puppeteer-core");
 }
-const fs = require("fs");
-const path = require("path");
-const { notifyAll, notifyStartup } = require("./notifier");
 
+const { notifyAll, notifyStartup } = require("./notifier");
 const http = require("http");
 
 // Load .env
@@ -94,6 +116,50 @@ async function resolveChromePath(puppeteerModule, appConfig) {
       }
     }
   } catch (e) {}
+
+  // 6. First-Run Auto-Installer for Bot-Hosting.net / Servers:
+  // If no browser binary was found anywhere, automatically download Chrome now!
+  console.log("==========================================================================");
+  console.log("  [First Run Setup] Chrome browser binary is not installed!               ");
+  console.log("  Automatically downloading Chrome for Testing into .cache...             ");
+  console.log("  Please wait 30-60 seconds (this only happens once)...                   ");
+  console.log("==========================================================================");
+
+  try {
+    execSync("npx puppeteer browsers install chrome", { stdio: "inherit", cwd: __dirname });
+    if (puppeteerModule && typeof puppeteerModule.executablePath === "function") {
+      const pPath = await puppeteerModule.executablePath();
+      if (pPath && fs.existsSync(pPath)) {
+        console.log("  [First Run Setup] Chrome installed successfully at:", pPath);
+        return pPath;
+      }
+    }
+  } catch (err) {
+    console.warn("  [First Run Setup] Standard Chrome install returned an error:", err.message);
+    try {
+      console.log("  [First Run Setup] Trying fallback: installing chrome-headless-shell...");
+      execSync("npx puppeteer browsers install chrome-headless-shell", { stdio: "inherit", cwd: __dirname });
+    } catch (e) {
+      console.error("  [First Run Setup] Fallback install error:", e.message);
+    }
+  }
+
+  // Check again after installation
+  try {
+    if (puppeteerModule && typeof puppeteerModule.executablePath === "function") {
+      const pPath = await puppeteerModule.executablePath();
+      if (pPath && fs.existsSync(pPath)) {
+        return pPath;
+      }
+    }
+  } catch (e) {}
+
+  // Check candidate paths again in case it got installed to one of the system paths
+  for (const candidate of linuxCandidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
 
   return null;
 }

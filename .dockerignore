@@ -3,3 +3,4 @@ chrome_session
 .env
 bot.log
 .git
+.cache
